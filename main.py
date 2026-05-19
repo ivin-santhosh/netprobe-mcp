@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math, time, sqlite3, hashlib, platform
 import io
 import os
 import re, requests
@@ -15,19 +16,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal, Callable, Union
 
 import psutil
-from fastmcp import FastMCP
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt             # Optional: if you already use matplotlib in report function
+except Exception:
+    plt = None
 
-from fpdf import FPDF
+try:
+    from fpdf import FPDF                       # Optional: PDF generation (if you already use fpdf)
+except Exception:
+    FPDF = None
 
 # ============================================================
 # MCP Server
 # ============================================================
-
+from fastmcp import FastMCP
 mcp = FastMCP("NetProbe MCP - Security Agent (Windows)")
-
 # ============================================================
 # Types (Azure Foundry / Strict Schema Friendly)
 # ============================================================
@@ -2847,4 +2852,732 @@ def soar_orchestrate(
             "Use custom_dsl_tool_create() with these steps to store as a playbook. "
             "Then run via custom_dsl_tool_run()."
         ),
+    }
+    
+# =========================================================
+# NETPROBE — AI SECURITY INTELLIGENCE LAYER (Append-only)
+# Implements:
+# 1) Behavioral Network Anomaly Detection
+# 2) Process Lineage Risk Reasoning
+# 3) Event Log Narrative Reconstruction
+# 4) Threat Hunting Hypothesis Generator
+# 5) Adaptive SOAR Response Recommendation
+# 6) Baseline Learning + Drift Detection
+# 7) SOC-style AI Report Generation
+# 8) Context-aware interpretation
+# 9) Multi-signal risk scoring engine
+# 10) Attack simulation reasoner (defensive)
+# =========================================================
+
+# -------------------------------
+# Storage / Baseline (SQLite)
+# -------------------------------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+NP_DATA_DIR = os.path.join(BASE_DIR, "netprobe_data")
+os.makedirs(NP_DATA_DIR, exist_ok=True)
+
+NP_DB_PATH = os.path.join(NP_DATA_DIR, "netprobe_ai_baseline.db")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _safe_json(obj: Any) -> str:
+    return json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+
+
+def _sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(NP_DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+
+def _init_db():
+    conn = _db()
+    cur = conn.cursor()
+
+    # Baseline for network destinations (IP/domain)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS baseline_network (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dest TEXT NOT NULL,
+        dest_type TEXT NOT NULL, -- ip/domain
+        first_seen_utc TEXT NOT NULL,
+        last_seen_utc TEXT NOT NULL,
+        seen_count INTEGER NOT NULL DEFAULT 1,
+        ports_json TEXT NOT NULL DEFAULT "[]"
+    )
+    """)
+
+    # Baseline for processes
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS baseline_process (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        process_name TEXT NOT NULL,
+        first_seen_utc TEXT NOT NULL,
+        last_seen_utc TEXT NOT NULL,
+        seen_count INTEGER NOT NULL DEFAULT 1,
+        cmdline_entropy REAL NOT NULL DEFAULT 0.0
+    )
+    """)
+
+    # Security findings history
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS findings_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_id TEXT NOT NULL,
+        created_utc TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        title TEXT NOT NULL,
+        evidence_json TEXT NOT NULL
+    )
+    """)
+
+    # Snapshot storage (optional)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_id TEXT NOT NULL,
+        created_utc TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+_init_db()
+
+
+# -------------------------------
+# Intelligence Data Models
+# -------------------------------
+
+@dataclass
+class Finding:
+    severity: str                # low/medium/high/critical
+    confidence: float            # 0.0 to 1.0
+    title: str
+    reasoning: str
+    mitre: List[str]
+    evidence: Dict[str, Any]
+    recommended_actions: List[str]
+
+
+@dataclass
+class AnalysisResult:
+    snapshot_id: str
+    created_utc: str
+    overall_risk_score: float
+    risk_level: str
+    findings: List[Finding]
+    narrative_timeline: List[str]
+    recommended_response: Dict[str, Any]
+    baseline_drift: Dict[str, Any]
+
+
+# -------------------------------
+# Utility Scoring / Entropy
+# -------------------------------
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    freq = {}
+    for ch in s:
+        freq[ch] = freq.get(ch, 0) + 1
+    ent = 0.0
+    length = len(s)
+    for c in freq.values():
+        p = c / length
+        ent -= p * math.log2(p)
+    return ent
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _risk_to_level(score: float) -> str:
+    if score >= 0.85:
+        return "CRITICAL"
+    if score >= 0.65:
+        return "HIGH"
+    if score >= 0.40:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _sev_rank(sev: str) -> int:
+    m = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+    return m.get(sev.upper(), 1)
+
+
+# -------------------------------
+# Baseline Update + Drift
+# -------------------------------
+
+def _update_baseline_network(dest: str, dest_type: str, port: Optional[int]):
+    conn = _db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id, ports_json, seen_count FROM baseline_network WHERE dest=? AND dest_type=?",
+                (dest, dest_type))
+    row = cur.fetchone()
+
+    now = _utc_now()
+    if row:
+        row_id, ports_json, seen_count = row
+        ports = set(json.loads(ports_json or "[]"))
+        if port:
+            ports.add(int(port))
+        cur.execute("""
+            UPDATE baseline_network
+            SET last_seen_utc=?, seen_count=?, ports_json=?
+            WHERE id=?
+        """, (now, seen_count + 1, json.dumps(sorted(list(ports))), row_id))
+    else:
+        ports = []
+        if port:
+            ports = [int(port)]
+        cur.execute("""
+            INSERT INTO baseline_network(dest, dest_type, first_seen_utc, last_seen_utc, seen_count, ports_json)
+            VALUES (?, ?, ?, ?, 1, ?)
+        """, (dest, dest_type, now, now, json.dumps(ports)))
+
+    conn.commit()
+    conn.close()
+
+
+def _update_baseline_process(proc_name: str, cmdline: str):
+    conn = _db()
+    cur = conn.cursor()
+
+    ent = _shannon_entropy(cmdline)
+    now = _utc_now()
+
+    cur.execute("SELECT id, seen_count FROM baseline_process WHERE process_name=?",
+                (proc_name,))
+    row = cur.fetchone()
+
+    if row:
+        row_id, seen_count = row
+        cur.execute("""
+            UPDATE baseline_process
+            SET last_seen_utc=?, seen_count=?, cmdline_entropy=?
+            WHERE id=?
+        """, (now, seen_count + 1, ent, row_id))
+    else:
+        cur.execute("""
+            INSERT INTO baseline_process(process_name, first_seen_utc, last_seen_utc, seen_count, cmdline_entropy)
+            VALUES (?, ?, ?, 1, ?)
+        """, (proc_name, now, now, ent))
+
+    conn.commit()
+    conn.close()
+
+
+def _baseline_stats() -> Dict[str, Any]:
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM baseline_network")
+    net_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM baseline_process")
+    proc_count = cur.fetchone()[0]
+    conn.close()
+    return {"baseline_network_entries": net_count, "baseline_process_entries": proc_count}
+
+
+def _detect_drift(current_network: List[Dict[str, Any]], current_processes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Drift = new destinations / new processes never seen before.
+    """
+    conn = _db()
+    cur = conn.cursor()
+
+    new_dests = []
+    for n in current_network:
+        dest = n.get("remote_ip") or n.get("remote_host") or ""
+        if not dest:
+            continue
+        dest_type = "ip" if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", dest) else "domain"
+        cur.execute("SELECT 1 FROM baseline_network WHERE dest=? AND dest_type=? LIMIT 1", (dest, dest_type))
+        if not cur.fetchone():
+            new_dests.append(dest)
+
+    new_procs = []
+    for p in current_processes:
+        name = (p.get("name") or "").strip().lower()
+        if not name:
+            continue
+        cur.execute("SELECT 1 FROM baseline_process WHERE process_name=? LIMIT 1", (name,))
+        if not cur.fetchone():
+            new_procs.append(name)
+
+    conn.close()
+
+    return {
+        "new_destinations": sorted(list(set(new_dests)))[:50],
+        "new_processes": sorted(list(set(new_procs)))[:50],
+        "drift_score": _clamp((len(new_dests) * 0.02) + (len(new_procs) * 0.01), 0, 1)
+    }
+
+
+# -------------------------------
+# Core AI Security Reasoner
+# -------------------------------
+
+SUSPICIOUS_CMD_PATTERNS = [
+    (r"powershell.*-enc", "Encoded PowerShell command", ["T1059.001"]),
+    (r"cmd\.exe.*/c.*whoami", "Recon command executed", ["T1082"]),
+    (r"reg\.exe.*add.*run", "Registry persistence attempt", ["T1547.001"]),
+    (r"schtasks\.exe.*/create", "Scheduled task persistence attempt", ["T1053.005"]),
+    (r"curl.*http", "Download from remote via curl", ["T1105"]),
+    (r"bitsadmin", "BITS transfer technique", ["T1105"]),
+    (r"certutil.*-urlcache", "Certutil download technique", ["T1105"]),
+]
+
+SUSPICIOUS_PORTS = {4444, 1337, 31337, 6666, 6667, 23, 3389, 5985, 5986}
+SUSPICIOUS_PROCESS_NAMES = {
+    "mimikatz.exe", "psexec.exe", "procdump.exe", "rclone.exe",
+    "ncat.exe", "nc.exe", "netcat.exe"
+}
+
+
+def _analyze_network_behavior(connections: List[Dict[str, Any]]) -> Tuple[List[Finding], float]:
+    findings: List[Finding] = []
+    score = 0.0
+
+    for c in connections:
+        rip = c.get("remote_ip") or ""
+        rport = c.get("remote_port")
+        proc = c.get("process_name") or "unknown"
+
+        if rport and int(rport) in SUSPICIOUS_PORTS:
+            findings.append(Finding(
+                severity="HIGH",
+                confidence=0.75,
+                title=f"Suspicious outbound port usage: {rport}",
+                reasoning=f"Connection from process '{proc}' uses high-risk port {rport}. "
+                          f"This can be associated with C2 channels or unauthorized remote access.",
+                mitre=["T1071", "T1571"],
+                evidence={"connection": c},
+                recommended_actions=[
+                    "Confirm whether this port is expected in your environment",
+                    "Identify the owning process and validate its signature",
+                    "Block the destination at firewall if unapproved",
+                    "Capture a forensic snapshot of the process"
+                ]
+            ))
+            score += 0.12
+
+        if rip and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", rip):
+            # crude heuristic: public IP ranges not local
+            if not (rip.startswith("10.") or rip.startswith("192.168.") or rip.startswith("172.")):
+                score += 0.01
+
+    return findings, _clamp(score, 0, 1)
+
+
+def _analyze_process_lineage(processes: List[Dict[str, Any]]) -> Tuple[List[Finding], float]:
+    """
+    Expects processes entries optionally containing:
+    pid, ppid, name, cmdline
+    """
+    findings: List[Finding] = []
+    score = 0.0
+
+    for p in processes:
+        name = (p.get("name") or "").lower()
+        cmd = (p.get("cmdline") or "").lower()
+
+        if name in SUSPICIOUS_PROCESS_NAMES:
+            findings.append(Finding(
+                severity="CRITICAL",
+                confidence=0.92,
+                title=f"Known offensive tool detected: {name}",
+                reasoning="Process name matches known offensive tooling. "
+                          "This strongly indicates unauthorized security testing or intrusion activity.",
+                mitre=["T1003", "T1569.002"],
+                evidence={"process": p},
+                recommended_actions=[
+                    "Isolate host if unauthorized",
+                    "Collect memory dump for forensics",
+                    "Identify user context and origin",
+                    "Hunt for lateral movement"
+                ]
+            ))
+            score += 0.25
+
+        # suspicious command patterns
+        for pat, desc, mitre in SUSPICIOUS_CMD_PATTERNS:
+            if re.search(pat, cmd):
+                ent = _shannon_entropy(cmd)
+                conf = 0.65 + _clamp(ent / 10, 0, 0.25)
+                findings.append(Finding(
+                    severity="HIGH",
+                    confidence=_clamp(conf, 0, 1),
+                    title=f"Suspicious commandline behavior: {desc}",
+                    reasoning=f"Commandline matches pattern: {desc}. "
+                              f"Entropy={ent:.2f} indicates possible obfuscation.",
+                    mitre=mitre,
+                    evidence={"process": p, "pattern": pat, "entropy": ent},
+                    recommended_actions=[
+                        "Validate if the command is legitimate administrative activity",
+                        "Inspect parent process and user session",
+                        "Review event logs around execution time"
+                    ]
+                ))
+                score += 0.10
+
+    return findings, _clamp(score, 0, 1)
+
+
+def _reconstruct_event_narrative(event_logs: List[Dict[str, Any]]) -> List[str]:
+    """
+    Converts event logs into a timeline narrative.
+    Input should be list of dicts with keys:
+    time, source, event_id, level, message
+    """
+    narrative = []
+    for e in event_logs[:80]:
+        t = e.get("time") or e.get("timestamp") or "unknown-time"
+        src = e.get("source") or "unknown-source"
+        eid = e.get("event_id") or "?"
+        msg = (e.get("message") or "").strip()
+        msg = re.sub(r"\s+", " ", msg)
+        if len(msg) > 160:
+            msg = msg[:160] + "..."
+        narrative.append(f"[{t}] {src} (Event {eid}): {msg}")
+    return narrative
+
+
+def _multi_signal_risk(findings: List[Finding], drift_score: float) -> float:
+    base = drift_score * 0.25
+    for f in findings:
+        sev = f.severity.upper()
+        if sev == "LOW":
+            base += 0.05
+        elif sev == "MEDIUM":
+            base += 0.10
+        elif sev == "HIGH":
+            base += 0.18
+        elif sev == "CRITICAL":
+            base += 0.30
+        base += (f.confidence * 0.05)
+    return _clamp(base, 0, 1)
+
+
+def _adaptive_response(findings: List[Finding], risk_score: float) -> Dict[str, Any]:
+    """
+    Defensive-only SOAR recommendation (no automatic destructive actions).
+    """
+    top = sorted(findings, key=lambda x: (_sev_rank(x.severity), x.confidence), reverse=True)[:5]
+
+    if risk_score >= 0.85:
+        posture = "ISOLATE_AND_FORENSICS"
+        actions = [
+            "Recommend isolating host from network (containment)",
+            "Collect volatile evidence (process list, connections, event logs)",
+            "Generate SOC report and open incident ticket",
+            "Perform credential compromise assessment"
+        ]
+    elif risk_score >= 0.65:
+        posture = "INVESTIGATE_AND_CONTAIN"
+        actions = [
+            "Investigate suspicious processes and connections",
+            "Validate legitimacy with asset owner",
+            "Block unapproved remote destinations",
+            "Escalate to SOC analyst for deeper triage"
+        ]
+    elif risk_score >= 0.40:
+        posture = "MONITOR_AND_VERIFY"
+        actions = [
+            "Monitor for repeated occurrences",
+            "Add destinations to watchlist",
+            "Review recent software installs and updates"
+        ]
+    else:
+        posture = "BASELINE_ONLY"
+        actions = [
+            "No action required; update baseline",
+            "Continue scheduled monitoring"
+        ]
+
+    return {
+        "recommended_posture": posture,
+        "priority_actions": actions,
+        "top_findings": [asdict(f) for f in top]
+    }
+
+
+def _save_history(snapshot_id: str, findings: List[Finding]):
+    conn = _db()
+    cur = conn.cursor()
+    now = _utc_now()
+    for f in findings:
+        cur.execute("""
+        INSERT INTO findings_history(snapshot_id, created_utc, severity, confidence, title, evidence_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            snapshot_id,
+            now,
+            f.severity.upper(),
+            float(f.confidence),
+            f.title,
+            json.dumps(f.evidence, ensure_ascii=False, default=str)
+        ))
+    conn.commit()
+    conn.close()
+
+
+def _save_snapshot(snapshot_id: str, snapshot: Dict[str, Any]):
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO snapshots(snapshot_id, created_utc, snapshot_json)
+    VALUES (?, ?, ?)
+    """, (snapshot_id, _utc_now(), json.dumps(snapshot, ensure_ascii=False, default=str)))
+    conn.commit()
+    conn.close()
+
+
+# -------------------------------
+# Main Intelligence Entry
+# -------------------------------
+
+def analyze_security_snapshot(snapshot: Dict[str, Any], store_baseline: bool = True) -> AnalysisResult:
+    """
+    This is the main AI brain.
+    It consumes raw snapshot JSON produced by your existing tools.
+    """
+
+    snapshot_id = snapshot.get("snapshot_id") or _sha256_text(_safe_json(snapshot))[:16]
+    created_utc = _utc_now()
+
+    # Expected fields (you can adapt your snapshot structure)
+    connections = snapshot.get("connections") or snapshot.get("network_connections") or []
+    processes = snapshot.get("processes") or []
+    event_logs = snapshot.get("event_logs") or snapshot.get("windows_event_logs") or []
+
+    # Baseline update
+    if store_baseline:
+        for c in connections:
+            dest = c.get("remote_ip") or c.get("remote_host")
+            port = c.get("remote_port")
+            if dest:
+                dtype = "ip" if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", str(dest)) else "domain"
+                _update_baseline_network(str(dest), dtype, int(port) if port else None)
+
+        for p in processes:
+            name = (p.get("name") or "").strip().lower()
+            cmd = (p.get("cmdline") or "").strip()
+            if name:
+                _update_baseline_process(name, cmd)
+
+    drift = _detect_drift(connections, processes)
+
+    # AI findings
+    findings: List[Finding] = []
+
+    f_net, s_net = _analyze_network_behavior(connections)
+    findings.extend(f_net)
+
+    f_proc, s_proc = _analyze_process_lineage(processes)
+    findings.extend(f_proc)
+
+    # Narrative
+    narrative = _reconstruct_event_narrative(event_logs)
+
+    # Multi-signal score
+    risk_score = _multi_signal_risk(findings, drift.get("drift_score", 0.0))
+    risk_level = _risk_to_level(risk_score)
+
+    # Adaptive response
+    response = _adaptive_response(findings, risk_score)
+
+    # Save
+    _save_snapshot(snapshot_id, snapshot)
+    _save_history(snapshot_id, findings)
+
+    return AnalysisResult(
+        snapshot_id=snapshot_id,
+        created_utc=created_utc,
+        overall_risk_score=float(risk_score),
+        risk_level=risk_level,
+        findings=findings,
+        narrative_timeline=narrative,
+        recommended_response=response,
+        baseline_drift=drift
+    )
+
+
+# =========================================================
+# MCP TOOLS — AI INTELLIGENCE (All 10 Use Cases)
+# =========================================================
+
+@mcp.tool()
+def ai_security_analyze_snapshot(snapshot_json: dict, store_baseline: bool = True) -> dict:
+    """
+    (Use Cases 1,2,3,6,8,9)
+    Takes a raw snapshot JSON and returns AI-level findings:
+    - behavioral anomalies
+    - baseline drift
+    - narrative timeline
+    - risk scoring
+    - response recommendation
+    """
+    result = analyze_security_snapshot(snapshot_json, store_baseline=store_baseline)
+    return {
+        "snapshot_id": result.snapshot_id,
+        "created_utc": result.created_utc,
+        "overall_risk_score": result.overall_risk_score,
+        "risk_level": result.risk_level,
+        "baseline_drift": result.baseline_drift,
+        "recommended_response": result.recommended_response,
+        "narrative_timeline": result.narrative_timeline,
+        "findings": [asdict(f) for f in result.findings],
+        "baseline_stats": _baseline_stats()
+    }
+
+
+@mcp.tool()
+def ai_generate_threat_hunting_hypothesis(hunt_goal: str) -> dict:
+    """
+    (Use Case 4)
+    Generates a threat hunting plan:
+    - what evidence to collect
+    - which tools to run
+    - what patterns to check
+    """
+    goal = hunt_goal.lower().strip()
+
+    playbooks = {
+        "credential theft": {
+            "hypothesis": "An attacker may attempt credential dumping or token theft.",
+            "evidence_to_collect": [
+                "Suspicious LSASS access attempts",
+                "Unusual use of procdump, comsvcs.dll, rundll32",
+                "Security event logs around logon events",
+                "Outbound traffic after privilege escalation"
+            ],
+            "recommended_tools": [
+                "list_active_connections",
+                "get_windows_event_logs",
+                "list_processes_with_cmdline",
+                "ai_security_analyze_snapshot"
+            ],
+            "mitre": ["T1003", "T1550"]
+        },
+        "persistence": {
+            "hypothesis": "An attacker may establish persistence via registry, scheduled tasks, or services.",
+            "evidence_to_collect": [
+                "New scheduled tasks",
+                "Registry Run key changes",
+                "New service creation events",
+                "Startup folder modifications"
+            ],
+            "recommended_tools": [
+                "get_windows_event_logs",
+                "list_processes_with_cmdline",
+                "ai_security_analyze_snapshot"
+            ],
+            "mitre": ["T1547", "T1053"]
+        }
+    }
+
+    for k, v in playbooks.items():
+        if k in goal:
+            return {"hunt_goal": hunt_goal, "playbook": v}
+
+    # generic
+    return {
+        "hunt_goal": hunt_goal,
+        "playbook": {
+            "hypothesis": "Potential suspicious activity may be present.",
+            "evidence_to_collect": [
+                "New/rare processes",
+                "New/rare outbound destinations",
+                "High-risk commandline patterns",
+                "Repeated authentication failures"
+            ],
+            "recommended_tools": [
+                "list_active_connections",
+                "get_windows_event_logs",
+                "list_processes_with_cmdline",
+                "ai_security_analyze_snapshot"
+            ],
+            "mitre": ["T1082", "T1059", "T1071"]
+        }
+    }
+
+
+@mcp.tool()
+def ai_attack_simulation_reasoner(simulation_type: str = "generic") -> dict:
+    """
+    (Use Case 10)
+    Defensive reasoning only.
+    It tells what signals would appear IF an attack happened,
+    so we can check whether we see them.
+    """
+    s = simulation_type.lower().strip()
+
+    if "ransomware" in s:
+        return {
+            "simulation": "ransomware",
+            "expected_signals": [
+                "Mass file rename/write operations",
+                "New unknown processes launched from temp folders",
+                "Outbound connections to rare domains",
+                "Event logs showing shadow copy deletion",
+                "Unusual CPU spikes (not measured, but inferred from behavior)"
+            ],
+            "what_to_check_now": [
+                "Recent process execution with high entropy cmdline",
+                "Event logs for vssadmin / wbadmin / bcdedit usage",
+                "New destinations not in baseline"
+            ],
+            "mitre": ["T1486", "T1490", "T1105"]
+        }
+
+    if "lateral" in s or "movement" in s:
+        return {
+            "simulation": "lateral_movement",
+            "expected_signals": [
+                "SMB connections to multiple internal hosts",
+                "Remote service creation events",
+                "Use of PsExec-like tooling",
+                "Multiple authentication attempts across hosts"
+            ],
+            "what_to_check_now": [
+                "Connections to port 445 / 3389 / 5985",
+                "Event logs for new logon sessions",
+                "Processes spawning from admin tools"
+            ],
+            "mitre": ["T1021", "T1569", "T1078"]
+        }
+
+    return {
+        "simulation": "generic_intrusion",
+        "expected_signals": [
+            "New/rare processes",
+            "Unusual outbound destinations",
+            "Suspicious commandline patterns",
+            "Persistence indicators"
+        ],
+        "what_to_check_now": [
+            "Baseline drift",
+            "Process lineage anomalies",
+            "Event narrative timeline"
+        ],
+        "mitre": ["T1059", "T1071", "T1547"]
     }
