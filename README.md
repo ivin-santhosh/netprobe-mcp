@@ -1,4 +1,5 @@
 <p align="center">
+  <img width="1577" height="1730" alt="Gemini_Generated_Image_47qndd47qndd47qn" src="https://github.com/user-attachments/assets/5086fbf9-b815-477e-b093-b0718e5271b9" /><br/>
   <h1 align="center">🌐 Netprobe MCP</h1>
   <p align="center">
     <strong>The AI-Native Cyber Intelligence & Observability Platform</strong>
