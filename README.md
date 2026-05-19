@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">🌐 Netprobe MCP (Protocol AETHER)</h1>
+  <h1 align="center">🌐 Netprobe MCP</h1>
   <p align="center">
     <strong>The AI-Native Cyber Intelligence & Observability Platform</strong>
     <br />
