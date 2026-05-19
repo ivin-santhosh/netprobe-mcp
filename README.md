@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="1577" height="1730" alt="Gemini_Generated_Image_47qndd47qndd47qn" src="https://github.com/user-attachments/assets/5086fbf9-b815-477e-b093-b0718e5271b9" /><br/>
+  <img width="250" height="292" alt="Gemini_Generated_Image_47qndd47qndd47qn" src="https://github.com/user-attachments/assets/5086fbf9-b815-477e-b093-b0718e5271b9" /><br/>
   <h1 align="center">🌐 Netprobe MCP</h1>
   <p align="center">
     <strong>The AI-Native Cyber Intelligence & Observability Platform</strong>
@@ -25,6 +25,7 @@
 - [Usage & Integration](#-usage--integration)
 - [Security & Validation](#-security--validation)
 - [Roadmap](#-roadmap)
+- [Netprobe Workflow](#-netprobe-workflow)
 - [Disclaimer](#-disclaimer)
 - [Contributing](#-contributing)
 
@@ -142,6 +143,11 @@ Because Netprobe executes raw system commands, security is the highest priority:
 - [x] Active Remediation Orchestrator (Firewall/EDR hooks)
 
 ---
+
+## ⏳ Netprobe Workflow
+
+[](https://github.com/user-attachments/assets/437eee55-ae24-4c15-956e-32c6726abf70)
+
 
 ## ⚠️ Disclaimer
 
